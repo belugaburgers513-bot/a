@@ -1,0 +1,939 @@
+#!/usr/bin/env bash
+#
+# beast.sh - Port Forward Beast INSTALLER
+# Run this ONCE on your public VPS (the hub). It does NOT show any menu.
+# It silently installs everything, then gives you a `beast` command to
+# use whenever you actually want to manage forwards.
+#
+# Usage: sudo bash beast.sh
+
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+  echo "Run this with sudo: sudo bash beast.sh"
+  exit 1
+fi
+
+CFG_DIR="/etc/pfw-beast"
+WG_NET_PREFIX="10.66.0"
+WG_HUB_IP="${WG_NET_PREFIX}.1"
+WG_PORT="51820"
+
+echo "[*] Installing dependencies (iptables, wireguard)..."
+mkdir -p "$CFG_DIR"
+chmod 700 "$CFG_DIR"
+touch "$CFG_DIR/forwards.db" "$CFG_DIR/servers.db"
+
+if command -v apt-get >/dev/null; then
+  apt-get update -y >/dev/null 2>&1
+  apt-get install -y iptables wireguard curl >/dev/null 2>&1
+elif command -v yum >/dev/null; then
+  yum install -y iptables wireguard-tools curl >/dev/null 2>&1
+fi
+
+if ! grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf 2>/dev/null; then
+  echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+fi
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+
+if [[ ! -f "$CFG_DIR/hub_private.key" ]]; then
+  echo "[*] Setting up this VPS as the WireGuard hub..."
+  wg genkey | tee "$CFG_DIR/hub_private.key" | wg pubkey > "$CFG_DIR/hub_public.key"
+  chmod 600 "$CFG_DIR/hub_private.key"
+  hub_priv=$(cat "$CFG_DIR/hub_private.key")
+  cat > /etc/wireguard/wg0.conf << WG0EOF
+[Interface]
+Address = ${WG_HUB_IP}/24
+ListenPort = ${WG_PORT}
+PrivateKey = ${hub_priv}
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT
+WG0EOF
+  systemctl enable wg-quick@wg0 >/dev/null 2>&1 || true
+  systemctl restart wg-quick@wg0
+fi
+
+echo "[*] Installing auto-restore of your forwards after reboot..."
+cat > /usr/local/bin/pfw-beast-restore.sh << 'RESTOREEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+CFG_DIR="/etc/pfw-beast"
+FWD_DB="$CFG_DIR/forwards.db"
+SRV_DB="$CFG_DIR/servers.db"
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+
+[[ -f "$FWD_DB" ]] || exit 0
+[[ -f "$SRV_DB" ]] || exit 0
+
+while IFS='|' read -r id proto lport sname dport; do
+  [[ -z "$id" ]] && continue
+  dip=$(awk -F'|' -v n="$sname" '$1==n{print $2}' "$SRV_DB")
+  [[ -z "$dip" ]] && continue
+  # remove first (ignore errors if not present) so re-running this script
+  # (e.g. on service restart) never creates duplicate rules
+  iptables -t nat -D PREROUTING -p "$proto" --dport "$lport" -j DNAT --to-destination "${dip}:${dport}" 2>/dev/null || true
+  iptables -t nat -D POSTROUTING -p "$proto" -d "$dip" --dport "$dport" -j MASQUERADE 2>/dev/null || true
+  iptables -D FORWARD -p "$proto" -d "$dip" --dport "$dport" -j ACCEPT 2>/dev/null || true
+  iptables -t nat -A PREROUTING -p "$proto" --dport "$lport" -j DNAT --to-destination "${dip}:${dport}" 2>/dev/null || true
+  iptables -t nat -A POSTROUTING -p "$proto" -d "$dip" --dport "$dport" -j MASQUERADE 2>/dev/null || true
+  iptables -A FORWARD -p "$proto" -d "$dip" --dport "$dport" -j ACCEPT 2>/dev/null || true
+done < "$FWD_DB"
+RESTOREEOF
+chmod +x /usr/local/bin/pfw-beast-restore.sh
+
+cat > /etc/systemd/system/pfw-beast-restore.service << 'SERVICEEOF'
+[Unit]
+Description=Restore Port Forward Beast rules after reboot
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+Requires=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pfw-beast-restore.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+
+echo "[*] Installing resource guard (auto-kills RAM/CPU-hogging processes)..."
+cat > /usr/local/bin/beast-resource-guard.sh << 'RESEOF'
+#!/usr/bin/env bash
+# Watches memory AND CPU load. Kills the biggest non-essential offender
+# whenever either crosses its threshold. Never touches whitelisted
+# system processes or this stack's own processes.
+set -uo pipefail
+
+RAM_THRESHOLD_MB=64      # kill something if available RAM drops below this
+CPU_LOAD_MULT=2          # kill something if 1-min load avg exceeds cores * this
+CHECK_INTERVAL=30
+LOG="/var/log/beast-resource-guard.log"
+
+WHITELIST_REGEX='^(sshd|systemd.*|init|kthreadd|wg|wg-quick|iptables|cron|crond|dbus-daemon|rsyslogd|agetty|login|bash|sh|beast|beast-resource-|networkd-dispat|systemd-resolve|systemd-network|chronyd|ntpd|multipathd|NetworkManager|journald)$'
+
+CORES=$(nproc 2>/dev/null || echo 1)
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+kill_top_offender() {
+  local sort_field=$1 reason=$2
+  while read -r pid usage comm; do
+    [[ "$pid" == "$$" ]] && continue
+    if [[ "$comm" =~ $WHITELIST_REGEX ]]; then
+      continue
+    fi
+    log "${reason}: killing PID ${pid} (${comm}), using ${usage}"
+    kill -TERM "$pid" 2>/dev/null || true
+    return 0
+  done < <(ps -eo pid,"${sort_field}",comm --sort="-${sort_field}" | tail -n +2)
+  return 1
+}
+
+while true; do
+  avail_mb=$(free -m | awk '/^Mem:/{print $7}')
+  if [[ -z "$avail_mb" ]]; then
+    avail_mb=$(free -m | awk '/^Mem:/{print $4}')
+  fi
+
+  if [[ -n "$avail_mb" ]] && (( avail_mb < RAM_THRESHOLD_MB )); then
+    log "Low memory: ${avail_mb}MB available (threshold ${RAM_THRESHOLD_MB}MB)."
+    kill_top_offender "%mem" "RAM"
+  fi
+
+  load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
+  load_threshold=$(( CORES * CPU_LOAD_MULT ))
+  # integer compare on the whole part of the load average
+  load1_int=${load1%%.*}
+  if [[ -n "$load1_int" ]] && (( load1_int >= load_threshold )); then
+    log "High load: ${load1} (threshold ${load_threshold}, cores ${CORES})."
+    kill_top_offender "%cpu" "CPU"
+  fi
+
+  sleep "$CHECK_INTERVAL"
+done
+RESEOF
+chmod +x /usr/local/bin/beast-resource-guard.sh
+
+cat > /etc/systemd/system/beast-resource-guard.service << 'RESSERVICEEOF'
+[Unit]
+Description=Beast Resource Guard - kills RAM/CPU-hogging processes when the box is under pressure
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/beast-resource-guard.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+RESSERVICEEOF
+
+systemctl daemon-reload
+systemctl enable pfw-beast-restore.service >/dev/null 2>&1 || true
+systemctl enable --now beast-resource-guard.service >/dev/null 2>&1 || true
+
+echo "[*] Installing the 'beast' management command..."
+cat > /usr/local/bin/beast << 'CLIEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+  echo "Run this with sudo: sudo beast"
+  exit 1
+fi
+
+CFG_DIR="__CFG_DIR__"
+FWD_DB="$CFG_DIR/forwards.db"
+SRV_DB="$CFG_DIR/servers.db"
+WG_NET_PREFIX="__WG_NET_PREFIX__"
+WG_PORT="__WG_PORT__"
+PASS_FILE="$CFG_DIR/password.hash"
+
+mkdir -p "$CFG_DIR"
+touch "$FWD_DB" "$SRV_DB"
+
+hash_pw() {
+  echo -n "$1" | sha256sum | awk '{print $1}'
+}
+
+setup_password() {
+  echo ""
+  echo "=========================================="
+  echo " No password set yet — let's set one now."
+  echo " This locks the tool so only you can run it."
+  echo "=========================================="
+  local p1 p2
+  while true; do
+    read -rsp "Set a password: " p1; echo ""
+    read -rsp "Confirm password: " p2; echo ""
+    if [[ -z "$p1" ]]; then
+      echo "Password can't be empty."
+      continue
+    fi
+    if [[ "$p1" != "$p2" ]]; then
+      echo "Didn't match, try again."
+      continue
+    fi
+    break
+  done
+  hash_pw "$p1" > "$PASS_FILE"
+  chmod 600 "$PASS_FILE"
+  echo "[+] Password set."
+}
+
+check_password() {
+  local attempts=0
+  local entered hash stored
+  stored=$(cat "$PASS_FILE")
+  while [[ $attempts -lt 3 ]]; do
+    read -rsp "Password: " entered; echo ""
+    hash=$(hash_pw "$entered")
+    if [[ "$hash" == "$stored" ]]; then
+      return 0
+    fi
+    attempts=$((attempts+1))
+    echo "Wrong password. ($((3-attempts)) attempts left)"
+    sleep 2
+  done
+  echo "Too many failed attempts. Exiting."
+  exit 1
+}
+
+get_pub_ip() {
+  curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "YOUR_VPS_PUBLIC_IP"
+}
+
+next_fwd_id() {
+  local last
+  last=$(tail -n1 "$FWD_DB" 2>/dev/null | cut -d'|' -f1)
+  echo $(( ${last:-0} + 1 ))
+}
+
+server_ip_by_name() {
+  awk -F'|' -v n="$1" '$1==n{print $2}' "$SRV_DB"
+}
+
+apply_rule() {
+  local proto=$1 lport=$2 dip=$3 dport=$4
+  iptables -t nat -A PREROUTING -p "$proto" --dport "$lport" -j DNAT --to-destination "${dip}:${dport}"
+  iptables -t nat -A POSTROUTING -p "$proto" -d "$dip" --dport "$dport" -j MASQUERADE
+  iptables -A FORWARD -p "$proto" -d "$dip" --dport "$dport" -j ACCEPT
+}
+
+remove_rule() {
+  local proto=$1 lport=$2 dip=$3 dport=$4
+  iptables -t nat -D PREROUTING -p "$proto" --dport "$lport" -j DNAT --to-destination "${dip}:${dport}" 2>/dev/null || true
+  iptables -t nat -D POSTROUTING -p "$proto" -d "$dip" --dport "$dport" -j MASQUERADE 2>/dev/null || true
+  iptables -D FORWARD -p "$proto" -d "$dip" --dport "$dport" -j ACCEPT 2>/dev/null || true
+}
+
+pause() {
+  echo ""
+  read -rp "Press Enter to go back to the menu..." _
+}
+
+is_valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 ))
+}
+
+safe_apply_rule() {
+  if ! apply_rule "$@"; then
+    echo "[!] Failed to apply that rule (maybe it already exists, or bad input). Nothing was saved."
+    return 1
+  fi
+}
+
+# Is this listen_port/proto already used by another forward we manage?
+# Pass an id to exclude (used when editing) or "" to check all.
+listen_port_taken() {
+  local proto=$1 lport=$2 exclude_id=${3:-}
+  awk -F'|' -v p="$proto" -v lp="$lport" -v ex="$exclude_id" \
+    '$2==p && $3==lp && $1!=ex{found=1} END{exit !found}' "$FWD_DB"
+}
+
+# Is this port already bound by a real process on this VPS? (not our DNAT
+# rules — those don't bind a socket — this catches things like sshd on 22)
+port_in_use_by_system() {
+  local proto=$1 port=$2
+  if ! command -v ss >/dev/null 2>&1; then
+    return 1
+  fi
+  if [[ "$proto" == "tcp" ]]; then
+    ss -H -tln "sport = :${port}" 2>/dev/null | grep -q .
+  else
+    ss -H -uln "sport = :${port}" 2>/dev/null | grep -q .
+  fi
+}
+
+# Quick reachability test to a destination ip:port. TCP only (UDP has no
+# reliable connect-test without a cooperating server on the other end).
+test_tcp_reachable() {
+  local ip=$1 port=$2
+  timeout 2 bash -c "echo > /dev/tcp/${ip}/${port}" 2>/dev/null
+}
+
+action_connect_server() {
+  local pub_ip; pub_ip=$(get_pub_ip)
+  local srv_count; srv_count=$(grep -c . "$SRV_DB" 2>/dev/null) || true
+  srv_count=${srv_count:-0}
+  local suggested_n=$(( srv_count + 1 ))
+
+  echo ""
+  echo "--- Connect a New Server (any provider, anywhere) ---"
+  read -rp "IP address of the server you want to connect: " target_ip
+  if [[ -z "$target_ip" ]]; then
+    echo "IP required, cancelled."
+    return
+  fi
+  read -rp "SSH user on that server [root]: " ssh_user
+  ssh_user=${ssh_user:-root}
+  read -rp "SSH port on that server [22]: " ssh_port
+  ssh_port=${ssh_port:-22}
+  read -rp "Name for this server [server${suggested_n}]: " name
+  name=${name:-server${suggested_n}}
+
+  if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "Name can only contain letters, numbers, - and _"
+    return
+  fi
+  if awk -F'|' -v n="$name" '$1==n{found=1} END{exit !found}' "$SRV_DB"; then
+    echo "That name is already used. Pick a different one."
+    return
+  fi
+
+  local last_octet next_octet wg_ip
+  last_octet=$(awk -F'|' '{print $2}' "$SRV_DB" | awk -F. '{print $4}' | sort -n | tail -1)
+  next_octet=$(( ${last_octet:-1} + 1 ))
+  if (( next_octet > 254 )); then
+    echo "Address pool is full (254 servers). Can't add more."
+    return
+  fi
+  wg_ip="${WG_NET_PREFIX}.${next_octet}"
+
+  local hub_pub; hub_pub=$(cat "$CFG_DIR/hub_public.key")
+
+  echo ""
+  echo "[*] Connecting to ${ssh_user}@${target_ip}:${ssh_port} to set it up..."
+  echo "    (you may be asked to confirm the host key and/or enter a password)"
+  echo ""
+
+  local remote_result
+  remote_result=$(ssh -o StrictHostKeyChecking=accept-new -p "$ssh_port" "${ssh_user}@${target_ip}" \
+    bash -s -- "$wg_ip" "$hub_pub" "$pub_ip" "$WG_PORT" << 'REMOTE_SCRIPT'
+set -euo pipefail
+wg_ip="$1"
+hub_pub="$2"
+hub_ip="$3"
+wg_port="$4"
+
+if command -v apt-get >/dev/null; then
+  apt-get update -y >/dev/null 2>&1
+  apt-get install -y wireguard iproute2 procps iputils-ping >/dev/null 2>&1
+elif command -v yum >/dev/null; then
+  yum install -y wireguard-tools iproute procps-ng iputils >/dev/null 2>&1
+fi
+
+mkdir -p /etc/wireguard
+chmod 700 /etc/wireguard
+
+peer_priv=$(wg genkey)
+peer_pub=$(echo "$peer_priv" | wg pubkey)
+
+cat > /etc/wireguard/wg0.conf << WGEOF
+[Interface]
+PrivateKey = ${peer_priv}
+Address = ${wg_ip}/24
+
+[Peer]
+PublicKey = ${hub_pub}
+Endpoint = ${hub_ip}:${wg_port}
+AllowedIPs = 10.66.0.0/24
+PersistentKeepalive = 25
+WGEOF
+chmod 600 /etc/wireguard/wg0.conf
+
+systemctl enable wg-quick@wg0 >/dev/null 2>&1 || true
+systemctl restart wg-quick@wg0
+
+hub_tunnel_ip="${wg_ip%.*}.1"
+
+cat > /usr/local/bin/join-tunnel-watchdog.sh << WATCHEOF
+#!/usr/bin/env bash
+set -uo pipefail
+HUB_IP="${hub_tunnel_ip}"
+CHECK_INTERVAL=30
+FAIL_LIMIT=3
+LOG="/var/log/join-tunnel-watchdog.log"
+log() { echo "\$(date '+%F %T') \$*" >> "\$LOG"; }
+fails=0
+while true; do
+  if ping -c 1 -W 3 "\$HUB_IP" >/dev/null 2>&1; then
+    fails=0
+  else
+    fails=\$((fails+1))
+    log "Hub unreachable (\${fails}/\${FAIL_LIMIT})"
+    if [[ \$fails -ge \$FAIL_LIMIT ]]; then
+      log "Restarting wg-quick@wg0 to reconnect..."
+      systemctl restart wg-quick@wg0 2>/dev/null || true
+      fails=0
+    fi
+  fi
+  sleep "\$CHECK_INTERVAL"
+done
+WATCHEOF
+chmod +x /usr/local/bin/join-tunnel-watchdog.sh
+
+cat > /etc/systemd/system/join-tunnel-watchdog.service << 'WATCHSERVICEEOF'
+[Unit]
+Description=Join Tunnel Watchdog - auto-reconnects the WireGuard tunnel if it drops
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+Requires=wg-quick@wg0.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/join-tunnel-watchdog.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+WATCHSERVICEEOF
+
+cat > /usr/local/bin/join-resource-guard.sh << 'RESEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+RAM_THRESHOLD_MB=64
+CPU_LOAD_MULT=2
+CHECK_INTERVAL=30
+LOG="/var/log/join-resource-guard.log"
+WHITELIST_REGEX='^(sshd|systemd.*|init|kthreadd|wg|wg-quick|iptables|cron|crond|dbus-daemon|rsyslogd|agetty|login|bash|sh|join-tunnel-wat|join-resource-g|networkd-dispat|systemd-resolve|systemd-network|chronyd|ntpd|multipathd|NetworkManager|journald)$'
+CORES=$(nproc 2>/dev/null || echo 1)
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+kill_top_offender() {
+  local sort_field=$1 reason=$2
+  while read -r pid usage comm; do
+    [[ "$pid" == "$$" ]] && continue
+    if [[ "$comm" =~ $WHITELIST_REGEX ]]; then
+      continue
+    fi
+    log "${reason}: killing PID ${pid} (${comm}), using ${usage}"
+    kill -TERM "$pid" 2>/dev/null || true
+    return 0
+  done < <(ps -eo pid,"${sort_field}",comm --sort="-${sort_field}" | tail -n +2)
+  return 1
+}
+while true; do
+  avail_mb=$(free -m | awk '/^Mem:/{print $7}')
+  if [[ -z "$avail_mb" ]]; then
+    avail_mb=$(free -m | awk '/^Mem:/{print $4}')
+  fi
+  if [[ -n "$avail_mb" ]] && (( avail_mb < RAM_THRESHOLD_MB )); then
+    log "Low memory: ${avail_mb}MB available (threshold ${RAM_THRESHOLD_MB}MB)."
+    kill_top_offender "%mem" "RAM"
+  fi
+  load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
+  load_threshold=$(( CORES * CPU_LOAD_MULT ))
+  load1_int=${load1%%.*}
+  if [[ -n "$load1_int" ]] && (( load1_int >= load_threshold )); then
+    log "High load: ${load1} (threshold ${load_threshold}, cores ${CORES})."
+    kill_top_offender "%cpu" "CPU"
+  fi
+  sleep "$CHECK_INTERVAL"
+done
+RESEOF
+chmod +x /usr/local/bin/join-resource-guard.sh
+
+cat > /etc/systemd/system/join-resource-guard.service << 'RESSERVICEEOF'
+[Unit]
+Description=Join Resource Guard - kills RAM/CPU-hogging processes when this box is under pressure
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/join-resource-guard.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+RESSERVICEEOF
+
+systemctl daemon-reload
+systemctl enable --now join-tunnel-watchdog.service >/dev/null 2>&1 || true
+systemctl enable --now join-resource-guard.service >/dev/null 2>&1 || true
+
+echo "OK:${peer_pub}"
+REMOTE_SCRIPT
+) || {
+    echo ""
+    echo "[!] Couldn't connect to or set up ${target_ip}. Check:"
+    echo "    - The IP is correct and reachable"
+    echo "    - SSH works: ssh -p ${ssh_port} ${ssh_user}@${target_ip}"
+    return
+  }
+
+  if [[ "$remote_result" != *OK:* ]]; then
+    echo ""
+    echo "[!] Setup may have failed on ${target_ip}. Output:"
+    echo "$remote_result"
+    return
+  fi
+
+  local peer_pub
+  peer_pub=$(echo "$remote_result" | grep -o 'OK:.*' | cut -d: -f2)
+
+  if [[ -z "$peer_pub" ]]; then
+    echo "[!] Didn't get a valid key back from ${target_ip}, aborting registration."
+    return
+  fi
+
+  wg set wg0 peer "$peer_pub" allowed-ips "${wg_ip}/32"
+  wg-quick save wg0 >/dev/null 2>&1 || true
+  echo "${name}|${wg_ip}|${peer_pub}" >> "$SRV_DB"
+
+  echo ""
+  echo "=========================================================="
+  echo " Done! '${name}' is connected and reachable at ${wg_ip}"
+  echo " Nothing to run over there — it's already set up and running."
+  echo " Use 'Add port forward' with server name '${name}' whenever"
+  echo " you're ready."
+  echo "=========================================================="
+}
+
+action_list_servers() {
+  echo ""
+  echo "=========== CONNECTED SERVERS ==========="
+  if [[ ! -s "$SRV_DB" ]]; then
+    echo "  (none yet — use 'Connect a new server' first)"
+  else
+    printf "%-15s %-15s\n" "NAME" "TUNNEL IP"
+    while IFS='|' read -r name ip pub; do
+      [[ -z "$name" ]] && continue
+      printf "%-15s %-15s\n" "$name" "$ip"
+    done < "$SRV_DB"
+  fi
+  echo "==========================================="
+}
+
+action_add_forward() {
+  action_list_servers
+  echo ""
+  echo "--- New Port Forward ---"
+  read -rp "Protocol (tcp/udp) [tcp]: " proto
+  proto=${proto:-tcp}
+  if [[ "$proto" != "tcp" && "$proto" != "udp" ]]; then
+    echo "Invalid protocol."
+    return
+  fi
+  read -rp "Port people connect to on THIS vps: " lport
+  read -rp "Server name (from list above): " sname
+  read -rp "Port on that server to reach: " dport
+
+  if ! is_valid_port "$lport"; then
+    echo "Invalid listen port — must be a number 1-65535."
+    return
+  fi
+  if ! is_valid_port "$dport"; then
+    echo "Invalid destination port — must be a number 1-65535."
+    return
+  fi
+
+  if listen_port_taken "$proto" "$lport"; then
+    echo "[!] ${proto}/${lport} is already used by another forward. Pick a different port or edit/delete the existing one."
+    return
+  fi
+  if port_in_use_by_system "$proto" "$lport"; then
+    echo "[!] Warning: something on this VPS is already listening on ${proto}/${lport}"
+    echo "    (e.g. sshd, a webserver, etc). Forwarding this port may conflict with it."
+    read -rp "    Continue anyway? (y/N): " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Cancelled."; return; }
+  fi
+
+  local dip; dip=$(server_ip_by_name "$sname")
+  if [[ -z "$dip" ]]; then
+    echo "No connected server named '${sname}'. Use 'Connect a new server' first."
+    return
+  fi
+
+  if [[ "$proto" == "tcp" ]]; then
+    echo "[*] Testing if ${dip}:${dport} is actually reachable..."
+    if test_tcp_reachable "$dip" "$dport"; then
+      echo "[+] Reachable — the destination is responding."
+    else
+      echo "[!] Not reachable right now (nothing listening there yet, or it's blocked)."
+      echo "    You can still add the forward — it'll work once that service is up."
+    fi
+  fi
+
+  local id; id=$(next_fwd_id)
+  if safe_apply_rule "$proto" "$lport" "$dip" "$dport"; then
+    echo "${id}|${proto}|${lport}|${sname}|${dport}" >> "$FWD_DB"
+    echo ""
+    echo "[+] Done! ${proto}/${lport} on this VPS now reaches ${sname} (${dip}) port ${dport}"
+  fi
+}
+
+action_bulk_add_forward() {
+  action_list_servers
+  echo ""
+  echo "--- Bulk Add Forwards ---"
+  echo "Format per line: proto,listen_port,server_name,dest_port"
+  echo "Example:"
+  echo "  tcp,2201,server1,22"
+  echo "  tcp,8080,server2,80"
+  echo "  udp,5000,server1,5000"
+  echo ""
+  echo "Paste lines, then press Ctrl+D when done:"
+  echo ""
+  local count=0
+  while IFS=',' read -r proto lport sname dport; do
+    proto=$(echo "$proto" | xargs); lport=$(echo "$lport" | xargs)
+    sname=$(echo "$sname" | xargs); dport=$(echo "$dport" | xargs)
+    [[ -z "$proto" ]] && continue
+    if [[ "$proto" != "tcp" && "$proto" != "udp" ]]; then
+      echo "  [skip] bad protocol: $proto,$lport,$sname,$dport"; continue
+    fi
+    if ! is_valid_port "$lport" || ! is_valid_port "$dport"; then
+      echo "  [skip] bad port: $proto,$lport,$sname,$dport"; continue
+    fi
+    if listen_port_taken "$proto" "$lport"; then
+      echo "  [skip] ${proto}/${lport} already used by another forward: $proto,$lport,$sname,$dport"; continue
+    fi
+    local dip; dip=$(server_ip_by_name "$sname")
+    if [[ -z "$dip" ]]; then
+      echo "  [skip] unknown server '${sname}': $proto,$lport,$sname,$dport"; continue
+    fi
+    local id; id=$(next_fwd_id)
+    if safe_apply_rule "$proto" "$lport" "$dip" "$dport"; then
+      echo "${id}|${proto}|${lport}|${sname}|${dport}" >> "$FWD_DB"
+      echo "  [+] added: ${proto}/${lport} -> ${sname} (${dip}):${dport}"
+      count=$((count+1))
+    fi
+  done
+  echo ""
+  echo "[+] Bulk add complete. Added ${count} forward(s)."
+}
+
+action_list_forwards() {
+  echo ""
+  echo "=========== PORT FORWARDS ==========="
+  if [[ ! -s "$FWD_DB" ]]; then
+    echo "  (none yet)"
+  else
+    printf "%-4s %-6s %-10s %-12s %-8s\n" "ID" "PROTO" "LISTEN" "SERVER" "PORT"
+    while IFS='|' read -r id proto lport sname dport; do
+      [[ -z "$id" ]] && continue
+      printf "%-4s %-6s %-10s %-12s %-8s\n" "$id" "$proto" "$lport" "$sname" "$dport"
+    done < "$FWD_DB"
+  fi
+  echo "======================================"
+}
+
+action_edit_forward() {
+  action_list_forwards
+  echo ""
+  read -rp "Enter the forward ID to edit: " id
+  local line; line=$(awk -F'|' -v id="$id" '$1==id' "$FWD_DB")
+  if [[ -z "$line" ]]; then
+    echo "No forward with that ID."
+    return
+  fi
+  IFS='|' read -r oid oproto olport osname odport <<< "$line"
+  local odip; odip=$(server_ip_by_name "$osname")
+
+  echo ""
+  echo "Editing forward ${id} (leave blank to keep current value)"
+  read -rp "Protocol [$oproto]: " proto
+  read -rp "Listen port [$olport]: " lport
+  read -rp "Server name [$osname]: " sname
+  read -rp "Destination port [$odport]: " dport
+  proto=${proto:-$oproto}; lport=${lport:-$olport}
+  sname=${sname:-$osname}; dport=${dport:-$odport}
+
+  if ! is_valid_port "$lport" || ! is_valid_port "$dport"; then
+    echo "Invalid port(s), cancelled."
+    return
+  fi
+
+  if listen_port_taken "$proto" "$lport" "$id"; then
+    echo "[!] ${proto}/${lport} is already used by a different forward. Pick another port."
+    return
+  fi
+
+  local dip; dip=$(server_ip_by_name "$sname")
+  if [[ -z "$dip" ]]; then
+    echo "Unknown server '${sname}', cancelled."
+    return
+  fi
+
+  remove_rule "$oproto" "$olport" "$odip" "$odport"
+  if safe_apply_rule "$proto" "$lport" "$dip" "$dport"; then
+    sed -i "s/^${id}|.*/${id}|${proto}|${lport}|${sname}|${dport}/" "$FWD_DB"
+    echo ""
+    echo "[+] Forward ${id} updated."
+  else
+    echo "[!] New rule failed — restoring the old one."
+    apply_rule "$oproto" "$olport" "$odip" "$odport" || true
+  fi
+}
+
+action_delete_forward() {
+  action_list_forwards
+  echo ""
+  read -rp "Enter the forward ID to delete: " id
+  local line; line=$(awk -F'|' -v id="$id" '$1==id' "$FWD_DB")
+  if [[ -z "$line" ]]; then
+    echo "No forward with that ID."
+    return
+  fi
+  IFS='|' read -r oid oproto olport osname odport <<< "$line"
+  local odip; odip=$(server_ip_by_name "$osname")
+  remove_rule "$oproto" "$olport" "$odip" "$odport"
+  sed -i "/^${id}|/d" "$FWD_DB"
+  echo ""
+  echo "[-] Forward ${id} deleted."
+}
+
+action_change_password() {
+  echo ""
+  local entered hash stored
+  stored=$(cat "$PASS_FILE")
+  read -rsp "Current password: " entered; echo ""
+  hash=$(hash_pw "$entered")
+  if [[ "$hash" != "$stored" ]]; then
+    echo "Wrong password, cancelled."
+    return
+  fi
+  setup_password
+}
+
+action_ram_status() {
+  echo ""
+  echo "=========== RESOURCE STATUS ==========="
+  free -h
+  echo ""
+  echo "Load average (1m 5m 15m), cores: $(nproc 2>/dev/null || echo '?')"
+  cat /proc/loadavg 2>/dev/null | awk '{print "  "$1, $2, $3}'
+  echo ""
+  echo "Top 5 RAM users right now:"
+  ps -eo pid,%mem,comm --sort=-%mem | head -n 6
+  echo ""
+  echo "Top 5 CPU users right now:"
+  ps -eo pid,%cpu,comm --sort=-%cpu | head -n 6
+  echo ""
+  echo "Recent resource guard actions:"
+  if [[ -f /var/log/beast-resource-guard.log ]]; then
+    tail -n 10 /var/log/beast-resource-guard.log
+  else
+    echo "  (no actions logged yet)"
+  fi
+  echo "========================================"
+}
+
+BEAST_SERVICES=(wg-quick@wg0 pfw-beast-restore beast-resource-guard)
+
+action_service_status() {
+  echo ""
+  echo "=========== SERVICE STATUS ==========="
+  for svc in "${BEAST_SERVICES[@]}"; do
+    local state
+    state=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
+    printf "%-25s %s\n" "$svc" "$state"
+  done
+  echo "======================================="
+}
+
+action_restart_services() {
+  echo ""
+  echo "--- Restarting all beast services ---"
+  for svc in "${BEAST_SERVICES[@]}"; do
+    echo -n "Restarting ${svc}... "
+    if systemctl restart "$svc" 2>/dev/null; then
+      echo "OK"
+    else
+      echo "FAILED (check: systemctl status ${svc})"
+    fi
+  done
+  echo ""
+  echo "[+] Done. Your existing forwards were NOT removed — wg-quick@wg0"
+  echo "    reloads its saved peers, and pfw-beast-restore reapplies your"
+  echo "    saved port forwards automatically on restart."
+}
+
+action_port_capacity() {
+  echo ""
+  echo "=========== PORT / CAPACITY CHECK ==========="
+  local active_forwards
+  active_forwards=$(grep -c . "$FWD_DB" 2>/dev/null) || true
+  active_forwards=${active_forwards:-0}
+  echo "Active forwards right now:      ${active_forwards}"
+  echo ""
+
+  echo "Max open files (per-process):   $(ulimit -n)"
+  echo "  Each active connection through a forward uses a file descriptor"
+  echo "  and a conntrack entry — this is your rough ceiling for concurrent"
+  echo "  connections, not for number of forward rules (those are cheap)."
+  echo ""
+
+  if [[ -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+    local ct_max ct_count
+    ct_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "?")
+    ct_count=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "?")
+    echo "Connection tracking (conntrack):"
+    echo "  In use:  ${ct_count}"
+    echo "  Max:     ${ct_max}"
+    echo "  This is the real limit on concurrent forwarded connections."
+  else
+    echo "Connection tracking info not available on this system"
+    echo "(conntrack module may not be loaded — it loads automatically"
+    echo "the first time a forward rule is used, so this is normal on"
+    echo "a freshly installed VPS)."
+  fi
+  echo ""
+
+  echo "Currently listening ports on this VPS (from the OS, not our rules):"
+  if command -v ss >/dev/null 2>&1; then
+    ss -tuln 2>/dev/null | awk 'NR==1 || NR>1{print "  "$0}' | head -n 15
+  else
+    echo "  (ss command not available)"
+  fi
+  echo "==============================================="
+}
+
+action_health_check() {
+  echo ""
+  echo "=========== FORWARD HEALTH CHECK ==========="
+  if [[ ! -s "$FWD_DB" ]]; then
+    echo "  (no forwards to check yet)"
+    echo "=============================================="
+    return
+  fi
+  printf "%-4s %-6s %-10s %-12s %-8s %-10s\n" "ID" "PROTO" "LISTEN" "SERVER" "PORT" "STATUS"
+  while IFS='|' read -r id proto lport sname dport; do
+    [[ -z "$id" ]] && continue
+    local dip status
+    dip=$(server_ip_by_name "$sname")
+    if [[ -z "$dip" ]]; then
+      status="NO SERVER"
+    elif [[ "$proto" == "tcp" ]]; then
+      if test_tcp_reachable "$dip" "$dport"; then
+        status="OK"
+      else
+        status="NOT RESPONDING"
+      fi
+    else
+      status="UDP (unverified)"
+    fi
+    printf "%-4s %-6s %-10s %-12s %-8s %-10s\n" "$id" "$proto" "$lport" "$sname" "$dport" "$status"
+  done < "$FWD_DB"
+  echo ""
+  echo "Note: UDP can't be reliably tested with a simple connect check —"
+  echo "a service being silent doesn't always mean it's down."
+  echo "=============================================="
+}
+
+if [[ ! -f "$PASS_FILE" ]]; then
+  setup_password
+else
+  check_password
+fi
+
+while true; do
+  clear
+  echo "=================================="
+  echo "        PORT FORWARD BEAST"
+  echo "=================================="
+  echo "1) Connect a new server (any provider)"
+  echo "2) Add port forward"
+  echo "3) Bulk add port forwards"
+  echo "4) List connected servers"
+  echo "5) List port forwards"
+  echo "6) Edit a forward"
+  echo "7) Delete a forward"
+  echo "8) Change password"
+  echo "9) RAM / CPU status"
+  echo "10) Service status"
+  echo "11) Restart all services"
+  echo "12) Port capacity check"
+  echo "13) Health check all forwards"
+  echo "0) Exit"
+  echo "=================================="
+  read -rp "Choose an option: " choice
+
+  case "$choice" in
+    1) action_connect_server; pause ;;
+    2) action_add_forward; pause ;;
+    3) action_bulk_add_forward; pause ;;
+    4) action_list_servers; pause ;;
+    5) action_list_forwards; pause ;;
+    6) action_edit_forward; pause ;;
+    7) action_delete_forward; pause ;;
+    8) action_change_password; pause ;;
+    9) action_ram_status; pause ;;
+    10) action_service_status; pause ;;
+    11) action_restart_services; pause ;;
+    12) action_port_capacity; pause ;;
+    13) action_health_check; pause ;;
+    0) echo "Bye!"; exit 0 ;;
+    *) echo "Invalid option"; pause ;;
+  esac
+done
+CLIEOF
+
+sed -i "s#__CFG_DIR__#${CFG_DIR}#g; s#__WG_NET_PREFIX__#${WG_NET_PREFIX}#g; s#__WG_PORT__#${WG_PORT}#g" /usr/local/bin/beast
+chmod +x /usr/local/bin/beast
+
+echo ""
+echo "=================================================="
+echo " Setup complete. This VPS is now the hub."
+echo "=================================================="
+echo " Nothing is running in your face — it's all quiet"
+echo " in the background (tunnel, auto-restore, resource guard)."
+echo ""
+echo " Whenever you want to manage forwards, just run:"
+echo "   sudo beast"
+echo "=================================================="
